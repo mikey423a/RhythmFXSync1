@@ -36,3 +36,23 @@ jobs:
             build/RhythmFXSync_artefacts/Release/VST3
             build/RhythmFXSync_artefacts/Release/Standalone
           if-no-files-found: error
+
+  release:                         # publishes the zipped builds as a GitHub Release so they can be downloaded with one click
+    needs: build
+    if: ${{ !cancelled() && needs.build.result != 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Zip and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dl
+          for d in *; do (cd "$d" && zip -qr "../$d.zip" .); done
+          gh release create "build-${{ github.run_number }}" ./*.zip --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" --title "Build ${{ github.run_number }}" \
+            --notes "Windows and macOS builds. Windows: unzip RhythmFXSync-windows-latest-guiON.zip and copy the VST3 folder's 'RhythmFX Sync.vst3' to C:\\Program Files\\Common Files\\VST3\\"
