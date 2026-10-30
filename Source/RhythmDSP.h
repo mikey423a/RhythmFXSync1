@@ -12,6 +12,17 @@ namespace rfx
 constexpr double kPi = 3.14159265358979323846;
 
 // ---------------------------------------------------------------- smoothing
+// Smooths a control value towards its target with a one-pole filter, so automation, preset changes and knob moves glide instead of
+// stepping once per audio block (a step in a gain or mix is heard as a click or "zipper" noise). The first target is taken at once.
+struct Smoothed
+{
+    float v = 0.f, t = 0.f, a = 1.f; bool primed = false;
+    void setTime (double sr, float ms) { a = ms <= 0.01f ? 1.f : 1.f - std::exp (-1.f / (ms * 0.001f * (float) sr)); }
+    void setTarget (float x) { t = x; if (! primed) { v = x; primed = true; } }
+    void reset() { primed = false; }
+    float next() { v += a * (t - v); return v; }
+};
+
 struct OnePole
 {
     float z = 0.f, a = 1.f;
@@ -21,6 +32,25 @@ struct OnePole
     }
     float process (float x) { z += a * (x - z); return z; }
 };
+
+// -------------------------------------------- 4-point cubic Hermite interpolation (hi-def delay reads)
+inline float hermite4 (float xm1, float x0, float x1, float x2, float t)
+{
+    const float c1 = 0.5f * (x1 - xm1), c2 = xm1 - 2.5f * x0 + 2.f * x1 - 0.5f * x2, c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+    return ((c3 * t + c2) * t + c1) * t + x0;
+}
+// pos = fractional read index into a circular buffer of `size` samples (any value; wrapped)
+inline float readCubic (const std::vector<float>& b, int size, float pos)
+{
+    pos = std::fmod (pos, (float) size);
+    if (pos < 0.f) pos += (float) size;
+    const int i0 = std::min ((int) pos, size - 1);
+    const float t = pos - (float) i0;
+    const int im1 = i0 > 0 ? i0 - 1 : size - 1;
+    int i1 = i0 + 1; if (i1 >= size) i1 -= size;
+    int i2 = i1 + 1; if (i2 >= size) i2 -= size;
+    return hermite4 (b[(size_t) im1], b[(size_t) i0], b[(size_t) i1], b[(size_t) i2], t);
+}
 
 // ------------------------------------------- TPT state-variable filter (Zavalishin)
 struct Svf
@@ -103,44 +133,145 @@ inline float driveProcess (float x, float amount)
 }
 
 // ------------------------------------------------------ stereo ping-pong delay
+// with an effect INSIDE the feedback loop: every repeat is passed through the chosen effect before it is
+// heard and before it is fed back, so the effect builds up with each trip round the loop.
+struct FbFxParams
+{
+    int   mode  = 0;       // 0 off, 1 tremolo, 2 chorus, 3 vibrato, 4 ring mod, 5 filter
+    float rate  = 3.f;     // Hz: tremolo / chorus / vibrato / filter-wobble speed
+    float depth = 0.5f;    // 0..1: effect amount (ring mod: dry<->ring blend)
+    float tone  = 0.5f;    // 0..1: ring-mod carrier (40 Hz..2.5 kHz) / filter cutoff (300 Hz..12 kHz)
+};
+
+// Character of the delay: 0 digital (clean), 1 tape (darker, saturated, lows trimmed every repeat), 2 analog / BBD (much darker, a
+// little saturation). wow = slow speed drift + flutter of the read position (0..1). duck = how far the repeats are pulled down while
+// you play (0..1); they swell back when you stop.
+struct DelayVoice
+{
+    int   voice = 0;
+    float wow = 0.f, duck = 0.f;
+};
+
 struct StereoDelay
 {
-    std::vector<float> bl, br;
-    int size = 0, w = 0;
-    float tSmooth = 0.f, lpL = 0.f, lpR = 0.f;
+    std::vector<float> bl, br, ml, mr;      // delay lines; ml/mr = short modulation lines for chorus/vibrato
+    int size = 0, w = 0, msize = 0, mw = 0;
+    float tSmooth = 0.f, lpL = 0.f, lpR = 0.f, fxLpL = 0.f, fxLpR = 0.f;
+    float vlp1[2] = {}, vlp2[2] = {}, vhp[2] = {}, aTapeLp = 0.5f, aBbdLp = 0.3f, aHp = 0.01f, duckEnv = 0.f, aDuckAtk = 0.01f, aDuckRel = 0.0001f;
+    double sr = 44100.0, ph = 0.0, rph = 0.0, wowPh = 0.0, flutPh = 0.0;
 
-    void prepare (double sr)
+    void prepare (double sampleRate)
     {
+        sr = sampleRate;
+        aTapeLp = 1.f - std::exp (-2.f * (float) kPi * 5500.f / (float) sr);       // tape: roll off above ~5.5 kHz on every repeat
+        aBbdLp  = 1.f - std::exp (-2.f * (float) kPi * 3000.f / (float) sr);       // analog / BBD: ~3 kHz, applied twice (12 dB / oct)
+        aHp     = 1.f - std::exp (-2.f * (float) kPi * 90.f / (float) sr);         // both: trim lows so repeats do not turn to mud
+        aDuckAtk = 1.f - std::exp (-1.f / (0.004f * (float) sr)); aDuckRel = 1.f - std::exp (-1.f / (0.15f * (float) sr));
+        for (int c = 0; c < 2; ++c) vlp1[c] = vlp2[c] = vhp[c] = 0.f;
+        duckEnv = 0.f; wowPh = flutPh = 0.0;
         size = (int) (sr * 4.0) + 8;
         bl.assign ((size_t) size, 0.f);
         br.assign ((size_t) size, 0.f);
-        w = 0; tSmooth = 0.f; lpL = lpR = 0.f;
+        msize = (int) (sr * 0.05) + 8;
+        ml.assign ((size_t) msize, 0.f);
+        mr.assign ((size_t) msize, 0.f);
+        w = 0; mw = 0; tSmooth = 0.f; lpL = lpR = fxLpL = fxLpR = 0.f; ph = rph = 0.0;
     }
-    float read (const std::vector<float>& b, float pos) const
+    static float readLine (const std::vector<float>& b, int sz, float pos) { return readCubic (b, sz, pos); }
+    float read (const std::vector<float>& b, float pos) const { return readLine (b, size, pos); }
+
+    // the in-loop effect: a = left repeat, b = right repeat (processed in place)
+    void fx (float& a, float& b, const FbFxParams& f)
     {
-        while (pos < 0.f) pos += (float) size;
-        int i0 = (int) pos;
-        const float fr = pos - (float) i0;
-        int i1 = i0 + 1;
-        if (i0 >= size) i0 -= size;
-        if (i1 >= size) i1 -= size;
-        return b[(size_t) i0] + fr * (b[(size_t) i1] - b[(size_t) i0]);
+        if (f.mode == 0) return;
+        ph += (double) f.rate / sr; if (ph >= 1.0) ph -= 1.0;
+        const float s1 = (float) std::sin (2.0 * kPi * ph), s2 = (float) std::cos (2.0 * kPi * ph);
+        const float depth = std::min (std::max (f.depth, 0.f), 1.f), tone = std::min (std::max (f.tone, 0.f), 1.f);
+        switch (f.mode)
+        {
+            case 1:   // tremolo (left and right in opposite phase for a stereo pulse)
+                a *= 1.f - depth * (0.5f + 0.5f * s1);
+                b *= 1.f - depth * (0.5f - 0.5f * s1);
+                break;
+            case 2:   // chorus: 12 ms +/- 5 ms, quadrature LFOs left/right, 50/50 with the repeat itself
+            case 3:   // vibrato: 4 ms +/- 3 ms, wet only
+            {
+                ml[(size_t) mw] = a; mr[(size_t) mw] = b;
+                const bool ch = f.mode == 2;
+                const float base = ch ? 12.f : 4.f, swing = (ch ? 5.f : 3.f) * depth;
+                const float dL = (base + swing * s1) * 0.001f * (float) sr, dR = (base + swing * s2) * 0.001f * (float) sr;
+                const float yL = readLine (ml, msize, (float) mw - dL), yR = readLine (mr, msize, (float) mw - dR);
+                if (++mw >= msize) mw = 0;
+                a = ch ? 0.5f * (a + yL) : yL;
+                b = ch ? 0.5f * (b + yR) : yR;
+                break;
+            }
+            case 4:   // ring modulator: carrier 40 Hz .. 2.5 kHz, depth = dry/ring blend
+            {
+                rph += 40.0 * std::pow (2.0, 6.0 * (double) tone) / sr; if (rph >= 1.0) rph -= 1.0;
+                const float c = (float) std::sin (2.0 * kPi * rph);
+                a += depth * (a * c - a);
+                b += depth * (b * c - b);
+                break;
+            }
+            default:  // filter: low-pass that gets darker every repeat; depth = wobble of the cutoff (+/- 1.5 octaves)
+            {
+                const float fc = 300.f * std::pow (2.f, 5.3f * tone) * std::pow (2.f, 1.5f * depth * s1);
+                const float k = 1.f - std::exp (-2.f * (float) kPi * std::min (fc, 0.45f * (float) sr) / (float) sr);
+                fxLpL += k * (a - fxLpL); fxLpR += k * (b - fxLpR);
+                a = fxLpL; b = fxLpR;
+                break;
+            }
+        }
     }
-    void process (float& L, float& R, float delaySamples, float fb, float mix, bool ping)
+
+    // tape / analog colouring of one repeat (both channels)
+    void voiceStage (float& a, float& b, int voice)
+    {
+        if (voice == 0) return;
+        const bool tape = voice == 1;
+        const float la = tape ? aTapeLp : aBbdLp;
+        float* io[2] = { &a, &b };
+        for (int c = 0; c < 2; ++c)
+        {
+            vlp1[c] += la * (*io[c] - vlp1[c]);
+            float y = vlp1[c];
+            if (! tape) { vlp2[c] += la * (y - vlp2[c]); y = vlp2[c]; }
+            vhp[c] += aHp * (y - vhp[c]); y -= vhp[c];                              // high-pass by subtracting a low-pass
+            *io[c] = tape ? std::tanh (1.7f * y) * (1.f / 1.7f) : std::tanh (1.25f * y) * (1.f / 1.25f);   // gentle saturation
+        }
+    }
+
+    void process (float& L, float& R, float delaySamples, float fb, float mix, bool ping, const FbFxParams& f = FbFxParams(), const DelayVoice& v = DelayVoice())
     {
         delaySamples = std::min (std::max (delaySamples, 32.f), (float) (size - 8));
         if (tSmooth <= 0.f) tSmooth = delaySamples;
         tSmooth += 0.001f * (delaySamples - tSmooth);
 
-        const float dl = read (bl, (float) w - tSmooth);
-        const float dr = read (br, (float) w - tSmooth);
-        lpL += 0.35f * (dl - lpL);          // damping in the feedback path
+        // wow (0.55 Hz, +/-0.8 ms) and flutter (7.3 Hz, +/-0.05 ms): about +/-5 and +/-4 cents at full amount
+        float tRead = tSmooth;
+        if (v.wow > 0.001f)
+        {
+            wowPh += 0.55 / sr; flutPh += 7.3 / sr; if (wowPh >= 1.0) wowPh -= 1.0; if (flutPh >= 1.0) flutPh -= 1.0;
+            tRead += v.wow * (float) (sr * (0.0008 * std::sin (2.0 * kPi * wowPh) + 0.00005 * std::sin (2.0 * kPi * flutPh)));
+        }
+        tRead = std::max (tRead, 4.f);
+
+        const float inLevel = std::max (std::fabs (L), std::fabs (R));
+        duckEnv += (inLevel > duckEnv ? aDuckAtk : aDuckRel) * (inLevel - duckEnv);
+        const float duckGain = 1.f - std::min (std::max (v.duck, 0.f), 1.f) * std::min (1.f, duckEnv * 6.f);
+
+        float dl = read (bl, (float) w - tRead);
+        float dr = read (br, (float) w - tRead);
+        fx (dl, dr, f);                      // effect on every repeat (what you hear AND what is fed back)
+        voiceStage (dl, dr, v.voice);        // tape / analog colouring on every repeat
+        lpL += 0.35f * (dl - lpL);           // damping in the feedback path
         lpR += 0.35f * (dr - lpR);
         if (ping) { bl[(size_t) w] = L + lpR * fb; br[(size_t) w] = R + lpL * fb; }
         else      { bl[(size_t) w] = L + lpL * fb; br[(size_t) w] = R + lpR * fb; }
         if (++w >= size) w = 0;
-        L += dl * mix;
-        R += dr * mix;
+        L += dl * mix * duckGain;            // ducking acts on what you hear only, not on what is fed back
+        R += dr * mix * duckGain;
     }
 };
 
@@ -380,29 +511,23 @@ struct Swell
 // `mod` (-1..1) is the LFO value for chorus / flanger / vibrato; `phase` (total cycles) drives the rotary.
 struct ModFx
 {
-    enum { Off, Chorus, Flanger, Vibrato, Rotary };
+    enum { Off, Chorus, Flanger, Vibrato, Rotary, Phaser };
     std::vector<float> bl, br;
     int size = 0, w = 0;
     double sr = 44100.0;
     float lp = 0.f, lpa = 0.1f;
+    float apz[2][6] = {}, fbz[2] = {};                 // phaser: 6 all-pass stages per channel + feedback memory
 
     void prepare (double s)
     {
         sr = s; size = (int) (s * 0.08) + 8;
         bl.assign ((size_t) size, 0.f); br.assign ((size_t) size, 0.f);
         w = 0; lp = 0.f;
+        for (auto& c : apz) for (auto& v : c) v = 0.f;
+        fbz[0] = fbz[1] = 0.f;
         lpa = 1.f - std::exp (-2.f * (float) kPi * 800.f / (float) s);        // 800 Hz rotary crossover
     }
-    float rd (const std::vector<float>& b, float d) const
-    {
-        float pos = (float) w - std::max (d, 1.f);
-        while (pos < 0.f) pos += (float) size;
-        int i0 = (int) pos; const float fr = pos - (float) i0;
-        int i1 = i0 + 1;
-        if (i0 >= size) i0 -= size;
-        if (i1 >= size) i1 -= size;
-        return b[(size_t) i0] + fr * (b[(size_t) i1] - b[(size_t) i0]);
-    }
+    float rd (const std::vector<float>& b, float d) const { return readCubic (b, size, (float) w - std::max (d, 2.f)); }
     void process (float& L, float& R, int type, float mod, double phase, float depth, float fb, float mix)
     {
         if (type == Off) return;
@@ -443,6 +568,21 @@ struct ModFx
             const float k = 1.f / (1.f + 0.7f * mix);
             L = (inL + mix * wl) * k;
             R = (inR + mix * wr) * k;
+        }
+        else if (type == Phaser)   // 6-stage all-pass phaser, sweep 180 Hz .. 6.6 kHz, L/R swept in opposite directions
+        {
+            const float u[2] = { 0.5f + 0.5f * depth * mod, 0.5f - 0.5f * depth * mod };
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const float f = std::min (180.f * std::pow (2.f, 5.2f * u[ch]), 0.45f * (float) sr);
+                const float t = std::tan ((float) kPi * f / (float) sr), a = (t - 1.f) / (t + 1.f);
+                const float in = ch == 0 ? inL : inR;
+                float y = in + fb * fbz[ch];
+                for (int k = 0; k < 6; ++k) { const float o = a * y + apz[ch][k]; apz[ch][k] = y - a * o; y = o; }
+                fbz[ch] = y;
+                (ch == 0 ? L : R) = in * (1.f - 0.5f * mix) + y * 0.5f * mix;
+            }
+            return;
         }
         else    // vibrato: pitch wobble from a modulated delay, crossfaded by Mix (1 = pure vibrato)
         {

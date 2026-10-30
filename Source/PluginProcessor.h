@@ -1,14 +1,18 @@
 #pragma once
+#ifndef RFX_NEW_GUI
+ #define RFX_NEW_GUI 0          // set to 1 by CMake (-DRFX_NEW_GUI=ON): enables the new editor widgets, see EditorWidgets.h
+#endif
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <array>
 #include <atomic>
 #include "RhythmDSP.h"
+#include "RhythmDSP2.h"
 
 // Every entry is both the APVTS parameter ID and the name of its cached raw-value pointer in `p`.
 #define RFX_PARAM_LIST(X) \
     X(rate) X(length) X(swing) X(fType) X(fSlope) X(fLow) X(fHigh) X(fRes) X(fGlide) X(fMix) \
     X(aRate) X(aLen) X(tDepth) X(tGlide) X(pRate) X(pLen) X(pDepth) X(pGlide) \
-    X(drive) X(dMix) X(dTime) X(dFb) X(dPing) X(rvMix) X(rvSize) X(comp) \
+    X(drive) X(dMix) X(dTime) X(dFb) X(dPing) X(dlyVoice) X(dlyWow) X(dlyDuck) X(rvDuck) X(dfxMode) X(dfxRate) X(dfxDepth) X(dfxTone) X(rvMix) X(rvSize) X(comp) \
     X(sLevel) X(sWave) X(sRel) X(drOn) X(drLevel) X(master) \
     X(inGain) X(gate) X(mix) X(bpm) X(hostSync) \
     X(fAtk) X(fRel) X(fEnv) X(fEnvDst) \
@@ -17,9 +21,12 @@
     X(lfoShape) X(lfoRate) X(lfoSync) X(lfoDiv) X(lfoAmt) X(lfoDst) \
     X(noteLo) X(noteHi) X(nAmt) X(nDst) \
     X(rsMode) X(rsNum) X(rsPick) \
+    X(drType) X(drTone) X(eqLow) X(eqMid) X(eqMidF) X(eqHigh) X(pxMode) X(pxMix) X(pxCents) \
+    X(spWidth) X(spSpace) X(spDepth) X(rvDamp) X(rvPre) X(rvShim) \
     X(fRand) X(arpScale) X(arpRoot) \
     X(mfType) X(mfRate) X(mfSync) X(mfDiv) X(mfRandom) X(mfDepth) X(mfFb) X(mfMix) \
-    X(swAmt) X(swAtk) X(swRel)
+    X(swAmt) X(swAtk) X(swRel) \
+    X(phMix) X(phRate) X(phDepth) X(phFb) X(phStg) X(rmMix) X(rmFreq) X(bcBits) X(bcDown)
 
 class RhythmFXProcessor : public juce::AudioProcessor
 {
@@ -42,7 +49,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 4.0; }
+    double getTailLengthSeconds() const override { return 10.0; }   // FDN reverb can ring ~9 s (Size = max)
 
     int getNumPrograms() override;
     int getCurrentProgram() override { return currentProgram; }
@@ -58,6 +65,15 @@ public:
     std::array<std::atomic<int>, 4>    drumMask;          // bit n = step n; lanes: kick, snare, hat, clap
     std::atomic<int> currentStep { 0 }, currentAmpStep { 0 }, currentPanStep { 0 }, currentDrumStep { 0 };
     std::atomic<bool> restartRequested { false };          // set by the editor's Restart button
+    // live read-outs for the editor (written by the audio thread, read by the GUI thread)
+    std::atomic<int>   pluckCount { 0 };                   // +1 for every detected note (audio pluck or MIDI note-on)
+    std::atomic<float> uiScale { 0.f };                    // editor size as a fraction of its design size; 0 = never set (saved with the session)
+    std::atomic<float> inputLevel { 0.f };                 // peak of the last block, after input trim and gate
+#if RFX_NEW_GUI
+    static constexpr int kSpecSize = 8192;                 // mono ring buffers feeding the spectrum view (power of two)
+    std::array<float, kSpecSize> specIn {}, specOut {};    // input (dry tap) and final output
+    std::atomic<int> specPos { 0 };                        // next write position
+#endif
 
     APVTS apvts;
 
@@ -99,7 +115,19 @@ private:
     std::vector<float> scratchR, dryL, dryR;
     rfx::DrumMachine drums;
     rfx::Synth synth;
-    juce::Reverb reverb;
+    rfx::HiDrive hiDrive;
+    rfx::Eq3 eq;
+    rfx::PitchFx pitchFx;
+    rfx::Spatial spatial;
+    rfx::FdnReverb fdn;
+    rfx::LatencyLine dryLine;
+    // control smoothers: mix / level knobs glide (20 ms) instead of stepping once per block
+    rfx::Smoothed smTDepth, smPDepth, smDrive, smFMix, smDMix, smRvMix, smPxMix, smPhMix, smRmMix, smMfMix,
+                  smSpWidth, smSpSpace, smSpDepth, smComp, smMix, smMaster;
+    float rvDuckEnv = 0.f;
+    rfx::Phaser phaser;
+    rfx::RingMod ringMod;
+    rfx::BitCrush crusher;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RhythmFXProcessor)
 };

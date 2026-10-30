@@ -1,0 +1,38 @@
+# Builds the VST3 + Standalone on Windows and macOS. Push this folder to GitHub, open the
+# Actions tab, and download the artifact - no local compiler needed.
+#
+# Two builds per OS:
+#   gui=OFF  the normal plugin. This is the one to install.
+#   gui=ON   the same plus the new editor widgets (RFX_NEW_GUI). It is allowed to fail (continue-on-error) while those
+#            widgets are still uncompiled, so a red ON build never blocks the normal one. Its log shows what to fix.
+name: Build
+on: [push, workflow_dispatch]
+jobs:
+  preflight:                       # fast checks, no JUCE: parameter IDs, editor layout, balance, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 Tools/preflight.py
+
+  build:
+    needs: preflight          # unit tests (Tools/preflight.py runs all of Tests/*.cpp) must pass first
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        gui: ['OFF', 'ON']
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.gui == 'ON' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRFX_COPY_AFTER_BUILD=OFF -DRFX_NEW_GUI=${{ matrix.gui }}
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RhythmFXSync-${{ matrix.os }}-gui${{ matrix.gui }}
+          path: |
+            build/RhythmFXSync_artefacts/Release/VST3
+            build/RhythmFXSync_artefacts/Release/Standalone
+          if-no-files-found: error

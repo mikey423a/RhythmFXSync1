@@ -13,6 +13,7 @@ FetchContent_MakeAvailable(JUCE)
 # Default: audio EFFECT (insert on a guitar track). Configure with -DRFX_AS_EFFECT=OFF
 # to build the instrument version (MIDI synth + drums, no audio input) instead.
 option(RFX_COPY_AFTER_BUILD "Install the VST3 into the system folder after building" ON)
+option(RFX_NEW_GUI "Enable the new editor widgets (pattern tools, orbit view, morph pad, perform page, spectrum). Not yet compiled - see HANDOFF.md section 12" OFF)
 option(RFX_AS_EFFECT "Build as an audio effect instead of an instrument" ON)
 if(RFX_AS_EFFECT)
     set(RFX_IS_SYNTH FALSE)
@@ -40,6 +41,11 @@ target_compile_definitions(RhythmFXSync PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0)
+
+if(RFX_NEW_GUI)
+    target_compile_definitions(RhythmFXSync PUBLIC RFX_NEW_GUI=1)
+    target_link_libraries(RhythmFXSync PRIVATE juce::juce_dsp)
+endif()
 
 target_link_libraries(RhythmFXSync
     PRIVATE juce::juce_audio_utils

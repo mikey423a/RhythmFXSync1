@@ -184,6 +184,49 @@ int main()
     }
     std::printf ("fxBad=%d\n", fxBad);
 
+    // ---- delay feedback-loop effects
+    int dfxBad = 0;
+    {
+        const float dly = 4800.f;                    // 100 ms
+        auto run = [&] (int mode, float depth, float tone, const std::vector<float>& in, float fb, float mix, bool ping)
+        {
+            StereoDelay d; d.prepare (sr); FbFxParams f; f.mode = mode; f.rate = 4.f; f.depth = depth; f.tone = tone;
+            std::vector<float> out; out.reserve (in.size());
+            for (float x : in) { float l = x, r = x; d.process (l, r, dly, fb, mix, ping, f); out.push_back (l - x); }   // wet only
+            return out;
+        };
+        // mode 0: first repeat arrives at the delay time, amplitude = mix, second repeat = mix * fb
+        std::vector<float> imp ((size_t) (sr * 1.0), 0.f); imp[0] = 1.f;
+        auto o0 = run (0, 0.5f, 0.5f, imp, 0.5f, 1.f, false);
+        const int t1 = (int) dly + 1;                       // tSmooth starts at the target: exact tap
+        if (std::fabs (o0[(size_t) t1 - 1] - 1.f) > 1e-3f && std::fabs (o0[(size_t) t1] - 1.f) > 1e-3f) ++dfxBad;
+        // tremolo (depth 1) on a steady tone: wet level swings between ~0 and full
+        std::vector<float> tone1 ((size_t) (sr * 2.0));
+        for (size_t i = 0; i < tone1.size(); ++i) tone1[i] = 0.5f * (float) std::sin (2.0 * kPi * 220.0 * (double) i / sr);
+        auto rms = [&] (const std::vector<float>& v, size_t a, size_t n) { double e = 0; for (size_t i = a; i < a + n; ++i) e += (double) v[i] * v[i]; return std::sqrt (e / (double) n); };
+        auto oT = run (1, 1.f, 0.5f, tone1, 0.f, 1.f, false);
+        double mn = 1e9, mx = 0;
+        for (size_t a = 20000; a + 480 < oT.size(); a += 480) { const double r = rms (oT, a, 480); mn = std::min (mn, r); mx = std::max (mx, r); }
+        if (! (mx > 0.25 && mn < 0.05)) ++dfxBad;
+        // ring mod (depth 1) moves energy away from the input pitch: 220 Hz component drops hard
+        auto oR = run (4, 1.f, 0.4f, tone1, 0.f, 1.f, false);
+        auto bin = [&] (const std::vector<float>& v, double hz) { double c = 0, sN = 0; for (size_t i = 24000; i < 72000; ++i) { c += v[i] * std::cos (2 * kPi * hz * (double) i / sr); sN += v[i] * std::sin (2 * kPi * hz * (double) i / sr); } return std::sqrt (c * c + sN * sN) / 24000.0; };
+        if (! (bin (oR, 220.0) < 0.2 * bin (run (0, 0, 0, tone1, 0.f, 1.f, false), 220.0))) ++dfxBad;
+        // filter mode darkens: 8 kHz tone is attenuated vs 220 Hz
+        std::vector<float> hf ((size_t) (sr * 1.0));
+        for (size_t i = 0; i < hf.size(); ++i) hf[i] = 0.5f * (float) std::sin (2.0 * kPi * 8000.0 * (double) i / sr);
+        if (! (rms (run (5, 0.f, 0.2f, hf, 0.f, 1.f, false), 20000, 4800) < 0.3 * rms (run (0, 0.f, 0.2f, hf, 0.f, 1.f, false), 20000, 4800))) ++dfxBad;
+        // stability: noise, max feedback, every mode, ping-pong on/off -> finite and bounded
+        std::vector<float> nz ((size_t) (sr * 8.0)); unsigned rs = 12345;
+        for (auto& v : nz) { rs = rs * 1664525u + 1013904223u; v = ((float) (rs >> 8) / 8388608.f - 1.f) * 0.5f; }
+        for (int m = 0; m < 6; ++m) for (int pp = 0; pp < 2; ++pp)
+        {
+            auto o = run (m, 1.f, 0.9f, nz, 0.95f, 1.f, pp == 1);
+            for (float v : o) if (! std::isfinite (v) || std::fabs (v) > 8.f) { ++dfxBad; break; }
+        }
+    }
+    std::printf ("dfxBad=%d\n", dfxBad);
+
     return (bad == 0 && vwBad == 0 && swBad == 0 && fxBad == 0 && peak < 4.0 && peak > 0.01 && steps >= 30 && panBad == 0 && slopeBad == 0
-            && stepBad == 0 && envBad == 0 && trigCount == 4 && silentTrig == 0 && pkBad == 0 && lfoBad == 0) ? 0 : 1;
+            && stepBad == 0 && envBad == 0 && trigCount == 4 && silentTrig == 0 && pkBad == 0 && lfoBad == 0 && dfxBad == 0) ? 0 : 1;
 }
